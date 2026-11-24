@@ -23,6 +23,10 @@ Thumbs.db
 *.p12
 mcp-tokens/
 
+# ── Nix / direnv ────────────────────────────────────────────────────────────
+/.direnv/
+!/.envrc
+
 # ── Edgecrab runtime state (generated at run-time, not source) ───────────────
 .edgecrab/
 .agent/
