@@ -1229,7 +1229,10 @@ pub async fn api_call_with_retry(
     //     tokens already sent); NOT safe to retry (would produce duplicates).
     //
     // We enforce this in the Err arm below.
-    let retry_budget = max_retries;
+    // A subscription inference request can consume plan usage even when the
+    // connection fails before a reply. Never replay it automatically.
+    let pinned_subscription = provider.name() == crate::oauth::chatgpt::PROVIDER;
+    let retry_budget = if pinned_subscription { 0 } else { max_retries };
     // FP19: Provider-stated retry-after delay, set when we receive a rate limit
     // error with an embedded "try again in X.Ys" hint. Used in the next
     // iteration's backoff instead of the fixed BASE_BACKOFF.
@@ -1451,6 +1454,10 @@ pub async fn api_call_with_retry(
                         elapsed_ms,
                         &e.to_string(),
                     );
+                    if pinned_subscription {
+                        last_err = Some(e.to_string());
+                        break 'attempt_loop;
+                    }
                     let visible_output_sent =
                         tokens_sent.load(std::sync::atomic::Ordering::Relaxed);
                     if !image_shrink_retried

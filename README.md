@@ -912,6 +912,30 @@ edgecrab --model groq/llama-3.3-70b-versatile "quick task"
 /reasoning high                      # enable extended thinking (Anthropic/OpenAI)
 ```
 
+### Subscription sign-in (CLI and TUI)
+
+EdgeCrab uses OpenAI's [Sign in with ChatGPT preview](https://developers.openai.com/siwc/token-sharing-open-source), which documents plan usage for [eligible ChatGPT Plus and Pro subscribers](https://developers.openai.com/siwc/quickstart). In the browser, authorize EdgeCrab to **use your ChatGPT plan**; signing in alone does not grant that permission. No OpenAI API key is used for `chatgpt-pro/*`:
+
+```bash
+edgecrab auth login chatgpt-pro
+edgecrab auth models chatgpt-pro
+edgecrab -q --model 'chatgpt-pro/<slug-from-the-list>' 'Reply with hello.'
+```
+
+In the TUI, use `/login chatgpt-pro`, then `/model` or `/models chatgpt-pro`. The picker lists the active account's selectable models when it can reach OpenAI. The account catalog and limits can change; a model from another account or a public launch announcement may not be available.
+
+On Plus, eligible requests draw from the same included ChatGPT Work and Codex allowance shared across participating apps, not a separate allowance for EdgeCrab. Check [ChatGPT → Settings → Usage](https://chatgpt.com/settings/usage) for plan and per-app limits and reset times. OpenAI can also use available ChatGPT credits after included usage runs out if you have separately enabled credit use for apps and your limits permit it. See [OpenAI's plan-usage guide](https://help.openai.com/en/articles/20001542-using-your-chatgpt-plan-in-other-apps-and-sites) for details. EdgeCrab does not fall back to an API key, another model, or another provider. `openai/<model>` still uses the separate API-key route.
+
+Sign-in is reused across restarts. Use `edgecrab auth status chatgpt-pro` to check it, or `edgecrab auth logout chatgpt-pro` to clear the active session. Previous Codex device-flow credentials are not imported: sign in again. To add another account, run the login command with `EDGECRAB_CHATGPT_ACCOUNT=new`; to switch back, use the saved client ID shown by `auth status` as that variable and run login again. Do not share authorization URLs or the credential store.
+
+For **SSH installs**, OpenAI's third-party flow uses a browser callback, not a device code. Bind exclusively to loopback on both ends. From your browser's machine, set up a tunnel in a separate terminal:
+
+```bash
+ssh -N -L 127.0.0.1:1455:127.0.0.1:1455 user@server
+```
+
+On the remote server, run `EDGECRAB_CHATGPT_CALLBACK_PORT=1455 edgecrab auth login chatgpt-pro --no-browser` and open the displayed URL in your local browser. Use the same unused port on both ends if 1455 is unavailable.
+
 **Why `copilot/auto` is now the best default:** GitHub Copilot decides which chat-capable model and billing path are valid for your live session. Following that server choice avoids avoidable model-specific throttles and keeps EdgeCrab aligned with the real VS Code experience.
 
 **Smart routing** (experimental): automatically selects cheap vs full model by turn complexity:

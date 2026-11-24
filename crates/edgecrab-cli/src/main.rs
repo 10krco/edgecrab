@@ -179,10 +179,12 @@ pub(crate) async fn create_provider_async(
             let pref = xai_credentials::xai_auth_preference_for_provider(provider_name);
             xai_credentials::prepare_xai_credentials_with_preference(false, pref).await?;
         }
-        edgecrab_core::oauth::inject_subscription_oauth_env(provider_name)
-            .await
-            .map_err(anyhow::Error::msg)?;
-        let canonical = normalize_provider_name(provider_name);
+        if canonical_cli_provider(provider_name) == "anthropic" {
+            edgecrab_core::oauth::inject_subscription_oauth_env(provider_name)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+        let canonical = canonical_cli_provider(provider_name);
         tracing::info!(
             provider = canonical,
             model = model_name,
@@ -203,7 +205,7 @@ fn create_provider_inner(model: &str) -> anyhow::Result<Arc<dyn edgequake_llm::L
     }
 
     if let Some((provider_name, model_name)) = explicit_provider_request(model) {
-        let canonical = normalize_provider_name(provider_name);
+        let canonical = canonical_cli_provider(provider_name);
         return create_explicit_provider(&canonical, model_name);
     }
 
@@ -223,6 +225,12 @@ fn explicit_provider_request(model: &str) -> Option<(&str, &str)> {
     model.split_once('/')
 }
 
+fn canonical_cli_provider(provider: &str) -> String {
+    edgecrab_core::oauth::subscription_provider(provider)
+        .map(str::to_owned)
+        .unwrap_or_else(|| normalize_provider_name(provider))
+}
+
 fn create_explicit_provider(
     provider_name: &str,
     model_name: &str,
@@ -239,21 +247,16 @@ fn create_explicit_provider_raw(
     provider_name: &str,
     model_name: &str,
 ) -> anyhow::Result<Arc<dyn edgequake_llm::LLMProvider>> {
-    if provider_name == "openai-codex" {
-        edgecrab_core::oauth::prepare_openai_codex_compatible_env();
-        return edgequake_llm::ProviderFactory::create_llm_provider(
-            "openai-compatible",
-            model_name,
-        )
-        .map(edgecrab_tools::wrap_provider_with_tracing)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "openai-codex (ChatGPT Pro) provider failed: {e}\n\
-                     Fix: edgecrab auth add chatgpt-pro"
-            )
-        });
+    if provider_name == edgecrab_core::oauth::chatgpt::PROVIDER {
+        let limit =
+            edgecrab_core::model_catalog::ModelCatalog::context_window(provider_name, model_name)
+                .unwrap_or(128_000) as usize;
+        return Ok(Arc::new(
+            edgecrab_core::chatgpt_subscription::ChatGptSubscriptionProvider::new(
+                model_name, limit,
+            )?,
+        ));
     }
-
     create_provider_for_model(provider_name, model_name).map_err(|e| {
         let guidance = match provider_name {
             "vscode-copilot" => {
@@ -316,7 +319,7 @@ impl OAuthRefreshingProvider {
         inner: Arc<dyn LLMProvider>,
     ) -> Arc<dyn LLMProvider> {
         // xai: SuperGrok OAuth + API key path; 401 → force OAuth refresh when mode=oauth
-        if matches!(provider_name, "anthropic" | "openai-codex" | "xai") {
+        if matches!(provider_name, "anthropic" | "xai") {
             Arc::new(Self {
                 provider_name: provider_name.to_string(),
                 model_name: model_name.to_string(),
@@ -349,34 +352,13 @@ impl OAuthRefreshingProvider {
                 unsafe { std::env::set_var("ANTHROPIC_API_KEY", token) };
                 Ok(())
             }
-            "openai-codex" => {
-                let token = edgecrab_core::oauth::refresh_codex_from_store()
-                    .await
-                    .map_err(|e| {
-                        edgequake_llm::LlmError::AuthError(format!(
-                            "re-login required: /login chatgpt-pro ({e})"
-                        ))
-                    })?;
-                // SAFETY: runtime auth refresh intentionally updates process-wide provider env.
-                unsafe {
-                    std::env::set_var("OPENAI_API_KEY", &token);
-                    std::env::set_var("OPENAI_COMPATIBLE_API_KEY", &token);
-                }
-                edgecrab_core::oauth::prepare_openai_codex_compatible_env();
-                Ok(())
-            }
-            "xai" => {
-                // Force refresh OAuth access token (grok-build style one-shot recovery).
-                xai_credentials::prepare_xai_credentials(true)
-                    .await
-                    .map_err(|e| {
-                        edgequake_llm::LlmError::AuthError(format!(
-                            "re-login required: /login grok or edgecrab auth add grok ({e})"
-                        ))
-                    })?;
-                Ok(())
-            }
-            _ => Ok(()),
+            _ => xai_credentials::prepare_xai_credentials(true)
+                .await
+                .map_err(|e| {
+                    edgequake_llm::LlmError::AuthError(format!(
+                        "re-login required: /login grok or edgecrab auth add grok ({e})"
+                    ))
+                }),
         }
     }
 
@@ -411,14 +393,7 @@ impl OAuthRefreshingProvider {
 #[async_trait]
 impl LLMProvider for OAuthRefreshingProvider {
     fn name(&self) -> &str {
-        // Stable runtime ids — do not lock (name does not change after rebuild).
-        match self.provider_name.as_str() {
-            "xai" => "xai",
-            "anthropic" => "anthropic",
-            "openai-codex" => "openai-compatible",
-            // Only wrapped for the three arms above; keep a safe default.
-            _ => "oauth-refresh",
-        }
+        self.provider_name.as_str()
     }
 
     fn model(&self) -> &str {
@@ -3300,6 +3275,18 @@ mod tests {
                 std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
             }
         }
+    }
+
+    #[test]
+    fn subscription_models_use_only_the_explicit_subscription_route() {
+        for prefix in ["chatgpt-pro", "openai-codex", "codex"] {
+            let provider = create_provider(&format!("{prefix}/test-account-slug"))
+                .expect("construct ChatGPT transport without credentials or I/O");
+            assert_eq!(provider.name(), edgecrab_core::oauth::chatgpt::PROVIDER);
+            assert_eq!(provider.model(), "test-account-slug");
+        }
+        assert_eq!(super::canonical_cli_provider("anthropic"), "anthropic");
+        assert_eq!(super::canonical_cli_provider("openai"), "openai");
     }
 
     #[test]

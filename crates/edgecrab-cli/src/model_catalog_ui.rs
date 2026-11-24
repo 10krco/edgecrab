@@ -124,6 +124,10 @@ pub fn build_model_selector_entries_with_auth(
 ) -> Vec<ModelEntry> {
     let mut all_models = Vec::new();
     for (provider, models) in grouped {
+        // Embedded or user catalog entries do not attest account entitlements.
+        if edgecrab_core::oauth::subscription_provider(provider).is_some() {
+            continue;
+        }
         let auth_part = {
             let mut parts = Vec::new();
             if let Some(badge) = provider_auth_badge(provider) {
@@ -182,6 +186,21 @@ pub fn build_model_selector_entries_with_auth(
     // stable sort by display still works; filter "grok" matches provider tag.
     all_models.sort_by(|left, right| left.display.cmp(&right.display));
     all_models
+}
+
+pub fn chatgpt_model_entries(
+    models: Vec<edgecrab_core::chatgpt_subscription::SubscriptionModel>,
+) -> impl Iterator<Item = ModelEntry> {
+    use edgecrab_core::oauth::chatgpt::PROVIDER;
+    models.into_iter().map(|model| ModelEntry {
+        display: format!("{PROVIDER}/{}", model.id),
+        provider: PROVIDER.to_string(),
+        detail: format!(
+            "{} · ChatGPT subscription · live account catalog",
+            model.label
+        ),
+        model_name: model.id,
+    })
 }
 
 /// Footer hint for model selector chrome (Hermes type-to-filter discoverability).
@@ -366,6 +385,31 @@ mod tests {
             "detail should badge OAuth: {}",
             sg.detail
         );
+    }
+
+    #[test]
+    fn subscription_picker_uses_only_live_rows_in_account_order() {
+        use edgecrab_core::chatgpt_subscription::SubscriptionModel;
+        let grouped = vec![
+            ("chatgpt-pro".into(), vec!["stale".into()]),
+            ("anthropic".into(), vec!["api-model".into()]),
+        ];
+        let mut entries = build_model_selector_entries(&grouped, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].display, "anthropic/api-model");
+        entries.extend(chatgpt_model_entries(vec![
+            SubscriptionModel {
+                id: "z-current".into(),
+                label: "First model".into(),
+            },
+            SubscriptionModel {
+                id: "a-other".into(),
+                label: "Second model".into(),
+            },
+        ]));
+        assert_eq!(entries[1].display, "chatgpt-pro/z-current");
+        assert!(entries[1].detail.contains("First model"));
+        assert_eq!(entries[2].display, "chatgpt-pro/a-other");
     }
 
     #[test]

@@ -10,6 +10,7 @@ use edgecrab_lsp as _;
 
 pub mod agent;
 pub mod auxiliary_model;
+pub mod chatgpt_subscription;
 pub mod completion_assessor;
 pub mod completion_reopen;
 pub mod compression;

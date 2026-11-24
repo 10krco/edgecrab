@@ -9,10 +9,9 @@ use anyhow::{Context, anyhow, bail};
 use chrono::Utc;
 use edgecrab_core::AppConfig;
 use edgecrab_core::oauth::{
-    AnthropicOAuthLoginOptions, CodexDeviceLoginOptions, CodexDevicePrompt, OPENAI_CODEX_PROVIDER,
-    is_anthropic_oauth_alias, is_openai_codex_alias, login_anthropic_oauth,
-    login_codex_device_oauth, read_anthropic_oauth_file, remove_anthropic_oauth_file,
-    remove_codex_oauth,
+    AnthropicOAuthLoginOptions, OPENAI_CODEX_PROVIDER, chatgpt, is_anthropic_oauth_alias,
+    is_openai_codex_alias, login_anthropic_oauth, read_anthropic_oauth_file,
+    remove_anthropic_oauth_file, remove_codex_oauth, subscription_provider,
 };
 use edgecrab_tools::tools::mcp_client::{read_mcp_token_status, remove_mcp_token, write_mcp_token};
 use edgequake_llm::providers::vscode::{auth::GitHubAuth, token::TokenManager};
@@ -359,6 +358,7 @@ pub async fn run_capture(command: AuthCommand) -> anyhow::Result<String> {
     match command {
         AuthCommand::List => list_targets().await,
         AuthCommand::Status { target } => status_target(target.as_deref()).await,
+        AuthCommand::Models { target } => subscription_models_report(&target).await,
         AuthCommand::Add {
             target,
             token,
@@ -396,6 +396,26 @@ pub async fn run_capture(command: AuthCommand) -> anyhow::Result<String> {
         AuthCommand::Grok { command } => run_grok_auth(command).await,
         AuthCommand::Remove { target } => remove_target(&target).await,
         AuthCommand::Reset { target } => reset_target(target.as_deref()).await,
+    }
+}
+
+pub async fn subscription_models_report(target: &str) -> anyhow::Result<String> {
+    use edgecrab_core::oauth::{chatgpt::PROVIDER, subscription_provider};
+    match subscription_provider(target) {
+        Some(PROVIDER) => {
+            let models = edgecrab_core::chatgpt_subscription::list_models().await?;
+            let mut lines = vec!["Models available to the active ChatGPT account (live):".into()];
+            if models.is_empty() {
+                lines.push("No selectable models were returned for this account.".into());
+            }
+            lines.extend(
+                models
+                    .into_iter()
+                    .map(|model| format!("  {PROVIDER}/{}  {}", model.id, model.label)),
+            );
+            Ok(lines.join("\n"))
+        }
+        _ => anyhow::bail!("Usage: edgecrab auth models chatgpt-pro"),
     }
 }
 
@@ -472,7 +492,9 @@ pub async fn login_target_capture(
             login_xai_oauth_capture(no_browser, manual_paste, loopback, oauth_code).await
         }
         AuthTarget::AnthropicOAuth => login_anthropic_oauth_capture(no_browser).await,
-        AuthTarget::OpenaiCodex => login_openai_codex_capture().await,
+        AuthTarget::OpenaiCodex => {
+            login_chatgpt_capture(no_browser, manual_paste, oauth_code).await
+        }
         AuthTarget::Provider(spec) => {
             if spec.interactive_login {
                 bail!(
@@ -534,37 +556,41 @@ async fn login_anthropic_oauth_capture(no_browser: bool) -> anyhow::Result<Strin
     Ok(msg)
 }
 
-fn print_codex_device_prompt(prompt: &CodexDevicePrompt) {
-    let mut stderr = io::stderr();
-    let _ = write!(stderr, "\x1b[2J\x1b[H");
-    let _ = writeln!(stderr, "ChatGPT Pro / Codex sign-in");
-    let _ = writeln!(stderr, "============================\n");
-    print_open_url_block(
-        &mut stderr,
-        &prompt.sign_in_url,
-        false,
-        "1. Open this URL in your browser:",
+async fn login_chatgpt_capture(
+    no_browser: bool,
+    manual_paste: bool,
+    oauth_code: Option<String>,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !manual_paste && oauth_code.is_none(),
+        "Sign in with ChatGPT uses a browser callback, not a pasted code; use --no-browser with SSH port forwarding for remote sign-in"
     );
-    let _ = writeln!(stderr, "2. Enter this one-time code:\n");
-    let _ = writeln!(stderr, "   {}\n", prompt.user_code);
-    let _ = writeln!(stderr, "Waiting for sign-in...");
-    let _ = stderr.flush();
-}
-
-async fn login_openai_codex_capture() -> anyhow::Result<String> {
-    let on_device_code = Arc::new(|prompt: CodexDevicePrompt| {
-        print_codex_device_prompt(&prompt);
-        let _ = open_auth_url(&prompt.sign_in_url);
-    });
-    let msg = login_codex_device_oauth(
-        None,
-        &CodexDeviceLoginOptions {
-            on_device_code: Some(on_device_code),
-        },
-    )
-    .await
-    .map_err(anyhow::Error::msg)?;
-    Ok(msg)
+    let remote = std::env::var_os("SSH_CONNECTION").is_some();
+    let no_browser = remote || oauth_flag(no_browser, "EDGECRAB_AUTH_NO_BROWSER");
+    let port = match std::env::var("EDGECRAB_CHATGPT_CALLBACK_PORT") {
+        Ok(value) => value
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .context("EDGECRAB_CHATGPT_CALLBACK_PORT must be a port number from 1 to 65535")?,
+        Err(_) if remote => 1455,
+        Err(_) => 0,
+    };
+    let account = std::env::var("EDGECRAB_CHATGPT_ACCOUNT").ok();
+    let new_account = account.as_deref() == Some("new");
+    chatgpt::login(account.as_deref().filter(|_| !new_account), new_account, port, move |url, port| {
+        eprintln!("Continue with ChatGPT");
+        if no_browser {
+            eprintln!("Open this link in your browser. If EdgeCrab is on a remote machine, first forward the loopback port from your computer:\n  ssh -N -L 127.0.0.1:{port}:127.0.0.1:{port} USER@HOST");
+        }
+        // Unlike the generic OAuth helper, do not write the URL to disk.
+        eprintln!("{url}");
+        if !no_browser && open_auth_url(url.as_str()).is_err() {
+            eprintln!("Could not open a browser automatically. Copy the link into your browser.");
+        }
+        eprintln!("Waiting for browser sign-in…");
+    }).await?;
+    show_chatgpt_status()
 }
 
 async fn run_grok_auth(command: crate::cli_args::GrokAuthCommand) -> anyhow::Result<String> {
@@ -780,6 +806,9 @@ pub fn command_from_slash_args(args: &str) -> Result<AuthCommand, String> {
         Some("status") => Ok(AuthCommand::Status {
             target: parts.get(1).cloned(),
         }),
+        Some("models") if parts.len() == 2 => Ok(AuthCommand::Models {
+            target: parts[1].clone(),
+        }),
         Some("login") => Ok(AuthCommand::Login {
             target: parts.get(1).cloned(),
             no_browser: false,
@@ -884,14 +913,15 @@ async fn list_targets() -> anyhow::Result<String> {
         edgecrab_core::oauth::anthropic_oauth_path().display(),
     )?;
 
-    let codex_path = edgecrab_core::oauth::auth_store::default_auth_path();
-    let codex_oauth = edgecrab_core::oauth::codex_has_credentials(&codex_path);
-    writeln!(
-        out,
-        "chatgpt-pro auth-file={} oauth={}",
-        yes_no(codex_oauth),
-        codex_path.display(),
-    )?;
+    let chatgpt_status = chatgpt::accounts()
+        .map(|accounts| {
+            accounts
+                .into_iter()
+                .find(|account| account.active)
+                .map_or("not signed in", |account| account.status)
+        })
+        .unwrap_or("account store unavailable");
+    writeln!(out, "chatgpt-pro {chatgpt_status}")?;
 
     for spec in PROVIDER_AUTH_SPECS {
         let stored = store.providers.contains_key(spec.canonical);
@@ -938,7 +968,7 @@ async fn status_target(raw_target: Option<&str>) -> anyhow::Result<String> {
             AuthTarget::NousPortal => show_nous_status(),
             AuthTarget::XaiOAuth => show_xai_oauth_status(),
             AuthTarget::AnthropicOAuth => show_anthropic_oauth_status(),
-            AuthTarget::OpenaiCodex => show_openai_codex_status(),
+            AuthTarget::OpenaiCodex => show_chatgpt_status(),
             AuthTarget::Provider(spec) => show_provider_status(spec),
         },
     }
@@ -980,10 +1010,10 @@ async fn add_target(
         AuthTarget::OpenaiCodex => {
             if token.is_some() {
                 bail!(
-                    "ChatGPT Pro / Codex uses device-code OAuth, not a static token. Run `edgecrab auth add chatgpt-pro`"
+                    "ChatGPT subscription uses Sign in with ChatGPT, not a static token. Run `edgecrab auth login chatgpt-pro`"
                 );
             }
-            login_openai_codex_capture().await
+            login_chatgpt_capture(no_browser, manual_paste, oauth_code).await
         }
         AuthTarget::Copilot => {
             let token = token.as_deref();
@@ -1081,11 +1111,11 @@ async fn remove_target(raw_target: &str) -> anyhow::Result<String> {
             ))
         }
         AuthTarget::OpenaiCodex => {
-            remove_codex_oauth(None).map_err(anyhow::Error::msg)?;
-            Ok(format!(
-                "Removed ChatGPT Pro / Codex OAuth from {}.",
-                edgecrab_core::oauth::auth_store::default_auth_path().display()
-            ))
+            if chatgpt::logout().await? {
+                Ok("Signed out of the active ChatGPT account in EdgeCrab.".into())
+            } else {
+                Ok("Signed out locally. OpenAI did not confirm remote revocation; disconnect EdgeCrab in ChatGPT Settings.".into())
+            }
         }
         AuthTarget::Provider(spec) => {
             for env_var in spec.env_vars {
@@ -1130,7 +1160,12 @@ async fn reset_all() -> anyhow::Result<String> {
     clear_proxy_oauth_providers()?;
     let _ = remove_anthropic_oauth_file();
     let _ = remove_codex_oauth(None);
-    Ok("Cleared EdgeCrab-managed Copilot, Claude/Codex OAuth, provider, proxy OAuth (nous/grok), and MCP auth caches.".into())
+    let confirmed = chatgpt::logout_all().await?;
+    let mut message = String::from("Cleared EdgeCrab-managed credentials.");
+    if !confirmed {
+        message.push_str(" OpenAI did not confirm all remote revocations; disconnect EdgeCrab in ChatGPT Settings.");
+    }
+    Ok(message)
 }
 
 fn clear_proxy_oauth_providers() -> anyhow::Result<()> {
@@ -1229,16 +1264,30 @@ fn show_anthropic_oauth_status() -> anyhow::Result<String> {
     Ok(out.trim_end().to_string())
 }
 
-fn show_openai_codex_status() -> anyhow::Result<String> {
-    let path = edgecrab_core::oauth::auth_store::default_auth_path();
-    let ready = edgecrab_core::oauth::codex_has_credentials(&path);
-    let mut out = String::from("chatgpt-pro / openai-codex (ChatGPT Pro device OAuth)\n");
-    writeln!(out, "auth-file:  {}", path.display())?;
-    writeln!(out, "logged-in:  {}", yes_no(ready))?;
-    writeln!(
-        out,
-        "login:      edgecrab auth add chatgpt-pro  |  edgecrab auth login chatgpt-pro"
-    )?;
+fn show_chatgpt_status() -> anyhow::Result<String> {
+    let mut out = String::from("chatgpt-pro (Sign in with ChatGPT)\n");
+    let accounts = chatgpt::accounts()?;
+    if accounts.is_empty() {
+        writeln!(out, "No saved ChatGPT accounts.")?;
+    }
+    for account in accounts {
+        let marker = if account.active { "active" } else { "saved" };
+        let label: String = account
+            .email
+            .as_deref()
+            .unwrap_or("ChatGPT account")
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .collect();
+        writeln!(
+            out,
+            "  {marker}: {label} [{}] — {}",
+            account.client_id, account.status
+        )?;
+    }
+    writeln!(out, "Login: edgecrab auth login chatgpt-pro")?;
+    writeln!(out, "Models: edgecrab auth models chatgpt-pro")?;
+    writeln!(out, "Manage plan usage: https://chatgpt.com/settings/usage")?;
     Ok(out.trim_end().to_string())
 }
 
@@ -1406,7 +1455,7 @@ fn copilot_cache_dir() -> anyhow::Result<std::path::PathBuf> {
 }
 
 fn auth_usage() -> &'static str {
-    "Usage: /auth [list|status [target]|add <target> [--token <secret>]|login [target]|remove <target>|reset [target]]\nTargets: copilot, nous, grok, claude-pro, chatgpt-pro, provider/<name>, mcp/<server>, or a configured MCP server name"
+    "Usage: /auth [list|status [target]|models <target>|add <target> [--token <secret>]|login [target]|remove <target>|reset [target]]\nTargets: copilot, nous, grok, claude-pro, chatgpt-pro, provider/<name>, mcp/<server>, or a configured MCP server name"
 }
 
 fn auth_store_path() -> PathBuf {
@@ -1524,9 +1573,7 @@ pub fn provider_disconnect_supported(catalog_provider: &str) -> bool {
     if resolve_provider(&canonical).is_some() {
         return true;
     }
-    is_anthropic_oauth_alias(&canonical)
-        || is_openai_codex_alias(&canonical)
-        || is_xai_oauth_target(&canonical)
+    is_anthropic_oauth_alias(&canonical) || is_xai_oauth_target(&canonical)
 }
 
 /// Synchronous provider disconnect for the TUI model picker (Hermes `model.disconnect` parity).
@@ -1551,11 +1598,9 @@ pub fn disconnect_catalog_provider(catalog_provider: &str) -> Result<String, Str
             edgecrab_core::oauth::anthropic_oauth_path().display()
         ));
     }
-    if is_openai_codex_alias(&canonical) {
-        remove_codex_oauth(None).map_err(|e| e.to_string())?;
-        return Ok(format!(
-            "Removed ChatGPT Pro / Codex OAuth from {}.",
-            edgecrab_core::oauth::auth_store::default_auth_path().display()
+    if let Some(provider) = subscription_provider(catalog_provider) {
+        return Err(format!(
+            "Run `edgecrab auth remove {provider}` to sign out explicitly."
         ));
     }
     if is_xai_oauth_target(&canonical) {
