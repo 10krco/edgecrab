@@ -716,6 +716,11 @@ pub enum AuthCommand {
         /// Optional auth target: `copilot`, `mcp/<server>`, or a configured MCP server name
         target: Option<String>,
     },
+    /// List models available to the active subscription account
+    Models {
+        /// Subscription target: `chatgpt-pro`
+        target: String,
+    },
     /// Add or cache credentials for one auth target
     Add {
         /// Auth target: `copilot`, `nous`, `grok`, `mcp/<server>`, or a configured MCP server name

@@ -6,7 +6,22 @@
 
 pub mod anthropic;
 pub mod auth_store;
+pub mod chatgpt;
 pub mod codex;
+
+/// Canonical name for Sign in with ChatGPT, separate from the `openai/` API route.
+pub fn subscription_provider(provider: &str) -> Option<&'static str> {
+    match provider.to_ascii_lowercase().as_str() {
+        "chatgpt-pro" | "chatgpt_pro" | "openai-codex" | "codex" => Some(chatgpt::PROVIDER),
+        _ => None,
+    }
+}
+
+pub fn is_subscription_model(model: &str) -> bool {
+    model
+        .split_once('/')
+        .is_some_and(|(provider, _)| subscription_provider(provider).is_some())
+}
 pub mod pkce;
 pub mod runtime;
 

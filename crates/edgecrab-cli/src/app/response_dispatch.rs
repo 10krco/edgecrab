@@ -1206,14 +1206,22 @@ impl App {
                         BackgroundOpResult::ModelCatalogReady {
                             models,
                             current_model,
+                            target,
+                            generation,
+                            subscription_notice,
                         } => {
-                            self.model_selector_refresh_in_flight = false;
-                            self.apply_model_selector_catalog(
-                                models,
-                                &current_model,
-                                true,
-                                self.model_selector_target,
-                            );
+                            if generation == self.model_selector_generation {
+                                self.model_selector_refresh_in_flight = false;
+                                self.apply_model_selector_catalog(
+                                    models,
+                                    &current_model,
+                                    true,
+                                    target,
+                                );
+                                if let Some(notice) = subscription_notice {
+                                    self.push_output(notice, OutputRole::System);
+                                }
+                            }
                         }
                         BackgroundOpResult::SystemMsg(text) => {
                             self.push_output(text, OutputRole::System);

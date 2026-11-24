@@ -1913,6 +1913,9 @@ enum BackgroundOpResult {
     ModelCatalogReady {
         models: Vec<ModelEntry>,
         current_model: String,
+        target: ModelSelectorTarget,
+        generation: u64,
+        subscription_notice: Option<String>,
     },
     /// Free-form text to push to the output pane (System role).
     SystemMsg(String),
@@ -4013,6 +4016,7 @@ pub struct App {
     model_selector_target: ModelSelectorTarget,
     /// True while background live model discovery is refreshing the selector.
     model_selector_refresh_in_flight: bool,
+    model_selector_generation: u64,
     /// Disconnect confirmation stage (Hermes modelPicker ^d).
     model_selector_stage: ModelPickerStage,
     /// Vision-model selector overlay (activated by `/vision_model`)
@@ -5301,6 +5305,7 @@ impl App {
             model_selector_seeded: false,
             model_selector_target: ModelSelectorTarget::Primary,
             model_selector_refresh_in_flight: false,
+            model_selector_generation: 0,
             model_selector_stage: ModelPickerStage::default(),
             vision_model_selector: FuzzySelector::new(),
             image_model_selector: FuzzySelector::new(),
@@ -18015,7 +18020,14 @@ impl App {
 
     fn open_model_selector_for(&mut self, current_model: &str, target: ModelSelectorTarget) {
         self.ensure_model_selector_seeded();
-        let entries = self.model_selector.items.clone();
+        // Fetch the account catalog anew; don't reuse rows from a previous account.
+        let entries = self
+            .model_selector
+            .items
+            .iter()
+            .filter(|entry| edgecrab_core::oauth::subscription_provider(&entry.provider).is_none())
+            .cloned()
+            .collect();
         self.apply_model_selector_catalog(entries, current_model, false, target);
     }
 
@@ -18025,10 +18037,6 @@ impl App {
         target: ModelSelectorTarget,
     ) {
         self.open_model_selector_for(&current_model, target);
-        if self.model_selector_refresh_in_flight {
-            return;
-        }
-
         let mut providers: Vec<String> = discovery_provider_statuses()
             .into_iter()
             .filter_map(|(provider, availability)| {
@@ -18048,11 +18056,29 @@ impl App {
         let tx = self.response_tx.clone();
 
         self.model_selector_refresh_in_flight = true;
+        self.model_selector_generation = self.model_selector_generation.wrapping_add(1);
+        let generation = self.model_selector_generation;
         self.needs_redraw = true;
 
         self.rt_handle.spawn(async move {
             let static_catalog = ModelCatalog::grouped_catalog();
-            let discovered = discover_multiple(&providers).await;
+            let (discovered, subscription) = tokio::join!(discover_multiple(&providers), async {
+                if target == ModelSelectorTarget::Primary
+                    && edgecrab_core::oauth::chatgpt::accounts().is_ok_and(|accounts| {
+                        accounts.iter().any(|account| {
+                            account.active
+                                && matches!(
+                                    account.status,
+                                    "ready" | "will refresh on next request"
+                                )
+                        })
+                    })
+                {
+                    Some(edgecrab_core::chatgpt_subscription::list_models().await)
+                } else {
+                    None
+                }
+            });
             let merged = merge_grouped_catalog_with_dynamic(&static_catalog, &discovered);
             let dynamic_lookup: BTreeMap<String, (DiscoverySource, BTreeSet<String>)> = discovered
                 .into_iter()
@@ -18063,13 +18089,27 @@ impl App {
                     )
                 })
                 .collect();
+            let mut models = build_model_selector_entries_with_auth(
+                &merged,
+                Some(&dynamic_lookup),
+                Some(&crate::xai_credentials::model_picker_auth_ready),
+            );
+            let subscription_notice = match subscription {
+                Some(Ok(account_models)) => {
+                    models.extend(crate::model_catalog_ui::chatgpt_model_entries(
+                        account_models,
+                    ));
+                    None
+                }
+                Some(Err(err)) => Some(format!("ChatGPT model discovery: {err}")),
+                None => None,
+            };
             let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::ModelCatalogReady {
-                models: build_model_selector_entries_with_auth(
-                    &merged,
-                    Some(&dynamic_lookup),
-                    Some(&crate::xai_credentials::model_picker_auth_ready),
-                ),
+                models,
                 current_model,
+                target,
+                generation,
+                subscription_notice,
             }));
         });
     }
@@ -18164,10 +18204,30 @@ impl App {
             self.push_output("Model discovery already in progress…", OutputRole::System);
             return;
         }
-        let static_catalog = ModelCatalog::grouped_catalog();
+        let trimmed = args.trim();
+        let subscription_target = trimmed.strip_prefix("refresh ").unwrap_or(trimmed).trim();
+        if let Some(target) = edgecrab_core::oauth::subscription_provider(subscription_target) {
+            let tx = self.response_tx.clone();
+            self.display_state = DisplayState::BgOp {
+                label: format!("Discovering {target}…"),
+                frame: 0,
+                started: Instant::now(),
+            };
+            self.needs_redraw = true;
+            self.rt_handle.spawn(async move {
+                let text = crate::auth_cmd::subscription_models_report(target)
+                    .await
+                    .unwrap_or_else(|err| format!("{target}: {err}"));
+                let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(text)));
+            });
+            return;
+        }
+        let mut static_catalog = ModelCatalog::grouped_catalog();
+        static_catalog.retain(|(provider, _)| {
+            edgecrab_core::oauth::subscription_provider(provider).is_none()
+        });
         let known_providers = ModelCatalog::provider_ids();
         let current = self.model_name.clone();
-        let trimmed = args.trim();
 
         if let Some(refresh_target) = trimmed.strip_prefix("refresh") {
             let target = refresh_target.trim().to_lowercase();

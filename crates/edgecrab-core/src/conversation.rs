@@ -892,8 +892,13 @@ impl Agent {
         // WHY route at conversation start: Simple messages ("thanks", "yes")
         // don't need a frontier model. We resolve the route once here and
         // use it for all API calls in this conversation turn.
+        let pinned_subscription = provider.name() == crate::oauth::chatgpt::PROVIDER;
         let smart_routing = SmartRoutingConfig {
-            enabled: config.model_config.smart_routing.enabled,
+            enabled: !pinned_subscription
+                && config.model_config.smart_routing.enabled
+                && !crate::oauth::is_subscription_model(
+                    &config.model_config.smart_routing.cheap_model,
+                ),
             cheap_model: config.model_config.smart_routing.cheap_model.clone(),
             cheap_base_url: config.model_config.smart_routing.cheap_base_url.clone(),
             cheap_api_key_env: config.model_config.smart_routing.cheap_api_key_env.clone(),
@@ -2070,8 +2075,11 @@ impl Agent {
                             }
                         }
                     }
-                    // Try fallback provider if configured
-                    if let Some(ref fb) = config.model_config.fallback {
+                    // Subscription requests must not fall through to another model or billing route.
+                    if !pinned_subscription
+                        && let Some(ref fb) = config.model_config.fallback
+                        && !crate::oauth::is_subscription_model(&fb.model)
+                    {
                         let fb_route = crate::model_router::fallback_route(fb);
                         tracing::warn!(
                             primary_error = %primary_err,
