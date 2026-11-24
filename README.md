@@ -1637,7 +1637,7 @@ edgecrab/
 
 | Tool  | Version               |
 | ----- | --------------------- |
-| Rust  | 1.86+                 |
+| Rust  | 1.95.0 (stable, pinned in `rust-toolchain.toml`) |
 | Cargo | bundled with Rust     |
 | OS    | macOS, Linux, Windows |
 
@@ -1659,6 +1659,18 @@ The release binary is statically linked — no OpenSSL, no libc versions to worr
 ## Contributing
 
 EdgeCrab welcomes contributions. The codebase has a zero-clippy-warnings policy and enforces `cargo fmt`.
+
+With Nix flakes enabled, run `nix develop` from the repository root. If you
+already have the direnv shell hook installed, run `direnv allow` instead to load
+that same environment automatically. The shell is defined for x86-64 and ARM64
+Linux and Apple Silicon macOS. It uses the pinned stable Rust version from
+`rust-toolchain.toml` and supplies the native build tools plus tooling for the
+Python, Node.js, and WASM SDKs and the documentation site.
+
+Install Python project dependencies in a virtual environment and JavaScript
+project dependencies with npm or pnpm. Integration tests that use external
+services (e.g. Docker or a live model provider) still need those configured
+separately.
 
 ```bash
 git clone https://github.com/raphaelmansuy/edgecrab
